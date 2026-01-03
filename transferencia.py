@@ -39,46 +39,97 @@ def load_data_from_local(path: str) -> pd.DataFrame:
     if missing:
         raise ValueError(f"CSV não contém colunas esperadas: {missing}")
 
-    df["DATA_DT"] = pd.to_datetime(df["DATA"], dayfirst=True, errors="coerce")
-    df["ANO"] = df["DATA_DT"].dt.year
+    # Normaliza STATUS cedo (evita valores estranhos)
     df["STATUS"] = df["STATUS"].apply(normalize_status)
 
-    # ID estável
-    df = df.reset_index(drop=False).rename(columns={"index": "ROW_ID"})
+    # Datas / Ano
+    df["DATA_DT"] = pd.to_datetime(df["DATA"], dayfirst=True, errors="coerce")
+    df["ANO"] = df["DATA_DT"].dt.year
+
+    # =========================
+    # ID estável (SEM duplicar ROW_ID)
+    # =========================
+    # Caso comum: usuário baixou o CSV do app e subiu de volta (ROW_ID já existe)
+    if "ROW_ID" in df.columns:
+        # Se por acaso houver duplicidade de colunas, removemos depois
+        # (mas ainda tentamos normalizar a coluna que sobrar)
+        df["ROW_ID"] = pd.to_numeric(df["ROW_ID"], errors="coerce")
+
+        # Se houver NaN, preenche com um id sequencial seguro
+        if df["ROW_ID"].isna().any():
+            df["ROW_ID"] = range(len(df))
+    else:
+        # Cria ROW_ID a partir do índice
+        df = df.reset_index(drop=False).rename(columns={"index": "ROW_ID"})
+
+    # Segurança extra: remove colunas duplicadas por nome (p.ex. ROW_ID repetido)
+    df = df.loc[:, ~df.columns.duplicated()].copy()
+
+    # Garante que ROW_ID seja inteiro quando possível
+    try:
+        df["ROW_ID"] = pd.to_numeric(df["ROW_ID"], errors="coerce").fillna(range(len(df))).astype(int)
+    except Exception:
+        # fallback (não deve acontecer)
+        df["ROW_ID"] = range(len(df))
+
     return df
 
 
 def apply_status_updates(df_full: pd.DataFrame, edited_rows: pd.DataFrame) -> pd.DataFrame:
     df_new = df_full.copy()
+
+    # Mantém somente o que importa
     upd = edited_rows[["ROW_ID", "STATUS"]].copy()
     upd["STATUS"] = upd["STATUS"].apply(normalize_status)
+    upd["ROW_ID"] = pd.to_numeric(upd["ROW_ID"], errors="coerce")
+
+    # Remove linhas sem ROW_ID válido
+    upd = upd.dropna(subset=["ROW_ID"]).copy()
+    upd["ROW_ID"] = upd["ROW_ID"].astype(int)
 
     upd_map = dict(zip(upd["ROW_ID"], upd["STATUS"]))
 
-    # Atualiza linha a linha por ROW_ID
-    def _new_status(rid):
-        if rid in upd_map:
-            return upd_map[rid]
-        # fallback (não deveria precisar, mas é seguro)
-        return df_new.loc[df_new["ROW_ID"] == rid, "STATUS"].iloc[0]
+    # Atualiza por map (muito mais estável do que função linha a linha)
+    df_new["STATUS"] = df_new["ROW_ID"].map(lambda rid: upd_map.get(int(rid), df_new.loc[df_new["ROW_ID"] == rid, "STATUS"].iloc[0]))
 
-    df_new["STATUS"] = df_new["ROW_ID"].map(_new_status)
     return df_new
 
 
 def dataframe_to_csv_bytes(df_full: pd.DataFrame) -> bytes:
     df_out = df_full.drop(columns=["DATA_DT", "ANO"], errors="ignore").copy()
+
+    # Mantém ROW_ID no CSV (ID estável para reimportar)
+    # Se você quiser remover ROW_ID do arquivo exportado, comente a linha abaixo:
+    # df_out = df_out.drop(columns=["ROW_ID"], errors="ignore")
+
     return df_out.to_csv(index=False, encoding="utf-8-sig").encode("utf-8-sig")
 
 
 def build_resumo_por_atleta(df_in: pd.DataFrame) -> pd.DataFrame:
+    # Se o filtro deixar DF vazio, retorna vazio
+    if df_in.empty:
+        return pd.DataFrame(columns=["NOME DO ATLETA", "ocorrencias", "ok", "nao_ok", "pendente", "tem_pendencia"])
+
+    # Garante que STATUS exista e esteja normalizado
+    if "STATUS" not in df_in.columns:
+        df_in = df_in.copy()
+        df_in["STATUS"] = ""
+
+    df_in = df_in.copy()
+    df_in["STATUS"] = df_in["STATUS"].apply(normalize_status)
+
+    # GroupBy
     g = df_in.groupby("NOME DO ATLETA", dropna=False)
+
+    # Obs: 'count' em ROW_ID pode cair em bug se ROW_ID estiver duplicado como coluna.
+    # A gente evita isso garantindo colunas não duplicadas no load_data_from_local.
     resumo = g.agg(
         ocorrencias=("ROW_ID", "count"),
         ok=("STATUS", lambda s: (s == "Ok").sum()),
         nao_ok=("STATUS", lambda s: (s == "Não-Ok").sum()),
         pendente=("STATUS", lambda s: (s == "").sum()),
     ).reset_index()
+
     resumo["tem_pendencia"] = resumo["pendente"] > 0
     return resumo
 
@@ -112,10 +163,10 @@ df = st.session_state.df_work
 # =========================
 st.sidebar.header("Filtros")
 
-anos_disponiveis = sorted([int(a) for a in df["ANO"].dropna().unique()])
+anos_disponiveis = sorted([int(a) for a in df["ANO"].dropna().unique()]) if "ANO" in df.columns else []
 ano_sel = st.sidebar.selectbox("Filtrar por ano (DATA)", options=["Todos"] + anos_disponiveis, index=0)
 
-# Filtro por STATUS (novo)
+# Filtro por STATUS
 status_sel = st.sidebar.multiselect(
     "Filtrar por STATUS",
     options=STATUS_OPTIONS,
@@ -130,6 +181,9 @@ st.sidebar.divider()
 colA, colB = st.sidebar.columns(2)
 with colA:
     if st.button("Recarregar CSV", use_container_width=True):
+        # limpa cache pra pegar eventuais atualizações do arquivo no repo
+        st.cache_data.clear()
+        df_base = load_data_from_local(CSV_PATH)
         st.session_state.df_work = df_base.copy()
         st.session_state.view = "lista"
         st.session_state.athlete = ""
@@ -146,7 +200,7 @@ st.sidebar.caption("STATUS: vazio / Ok / Não-Ok")
 def apply_filters_for_list(df_in: pd.DataFrame) -> pd.DataFrame:
     df_f = df_in.copy()
 
-    if ano_sel != "Todos":
+    if ano_sel != "Todos" and "ANO" in df_f.columns:
         df_f = df_f[df_f["ANO"] == int(ano_sel)]
 
     # status (se nada selecionado, não mostra nada)
@@ -280,7 +334,7 @@ def view_ficha():
     # (datas inválidas/NaT vão para o fim)
     df_a = df_a.sort_values(["DATA_DT", "ROW_ID"], ascending=[True, True], na_position="last")
 
-    # mostra sem DATA_DT
+    # Mostra sem DATA_DT
     df_show = df_a[["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
 
     st.caption(f"Ocorrências encontradas: **{len(df_show)}**")
@@ -315,7 +369,7 @@ def view_ficha():
     with c2:
         st.download_button(
             "⬇️ Baixar CSV atualizado",
-            data=dataframe_to_csv_bytes(df),
+            data=dataframe_to_csv_bytes(st.session_state.df_work),
             file_name="Transferencias_Internacionais_ATUALIZADO.csv",
             mime="text/csv",
             use_container_width=True,
@@ -329,4 +383,3 @@ if st.session_state.view == "lista":
     view_lista()
 else:
     view_ficha()
-
