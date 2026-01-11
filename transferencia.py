@@ -22,6 +22,26 @@ def normalize_status(x) -> str:
     return s if s in STATUS_OPTIONS else ""
 
 
+def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Renomeia colunas duplicadas adicionando sufixos __2, __3...
+    Isso evita bugs onde df['COL'] vira DataFrame em vez de Series.
+    """
+    cols = list(df.columns)
+    seen = {}
+    new_cols = []
+    for c in cols:
+        if c not in seen:
+            seen[c] = 1
+            new_cols.append(c)
+        else:
+            seen[c] += 1
+            new_cols.append(f"{c}__{seen[c]}")
+    df = df.copy()
+    df.columns = new_cols
+    return df
+
+
 @dataclass
 class GitHubCfg:
     token: str
@@ -100,28 +120,44 @@ def gh_put_file(cfg: GitHubCfg, new_text: str, sha: str, message: str) -> None:
 @st.cache_data(show_spinner=False)
 def load_df_from_github(cfg: GitHubCfg) -> tuple[pd.DataFrame, str, str]:
     raw_text, sha = gh_get_file(cfg)
-    df = pd.read_csv(pd.io.common.StringIO(raw_text))
 
-    # Remove colunas duplicadas por nome (segurança extra)
-    df = df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
+    df = pd.read_csv(pd.io.common.StringIO(raw_text))
+    df = dedupe_columns(df)  # evita qualquer duplicidade vindo do CSV
 
     required = ["NOME DO ATLETA", "DE", "PARA", "PAÍS", "DATA", "STATUS"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"CSV não contém colunas esperadas: {missing}")
 
+    # Auxiliares
     df["DATA_DT"] = pd.to_datetime(df["DATA"], dayfirst=True, errors="coerce")
     df["ANO"] = df["DATA_DT"].dt.year
     df["STATUS"] = df["STATUS"].apply(normalize_status)
 
+    # Cria ROW_ID e depois dedupe (por segurança máxima)
     df = df.reset_index(drop=False).rename(columns={"index": "ROW_ID"})
+    df = dedupe_columns(df)
+
     return df, sha, raw_text
 
 
 def dataframe_to_csv_text(df_full: pd.DataFrame) -> str:
     df_out = df_full.drop(columns=["DATA_DT", "ANO"], errors="ignore").copy()
-    # Também remove duplicadas antes de salvar
-    df_out = df_out.loc[:, ~pd.Index(df_out.columns).duplicated()].copy()
+    df_out = dedupe_columns(df_out)
+
+    # IMPORTANTE:
+    # Se existirem colunas ROW_ID__2 etc, elas vieram de alguma duplicidade; não devem ir pro CSV final.
+    # Mantemos apenas a primeira ROW_ID, e eliminamos as duplicadas.
+    cols_keep = []
+    seen_base = set()
+    for c in df_out.columns:
+        base = c.split("__")[0]
+        if base in seen_base:
+            continue
+        seen_base.add(base)
+        cols_keep.append(c)
+    df_out = df_out[cols_keep].copy()
+
     return df_out.to_csv(index=False, encoding="utf-8-sig")
 
 
@@ -131,11 +167,22 @@ def dataframe_to_csv_bytes(df_full: pd.DataFrame) -> bytes:
 
 def apply_status_updates(df_full: pd.DataFrame, edited_rows: pd.DataFrame) -> pd.DataFrame:
     df_new = df_full.copy()
+
+    # edited_rows sempre tem ROW_ID "simples" (1 coluna)
     upd = edited_rows[["ROW_ID", "STATUS"]].copy()
     upd["STATUS"] = upd["STATUS"].apply(normalize_status)
     upd_map = dict(zip(upd["ROW_ID"], upd["STATUS"]))
 
-    df_new["STATUS"] = df_new.apply(lambda r: upd_map.get(r["ROW_ID"], r["STATUS"]), axis=1)
+    # Aqui garantimos que usamos a coluna ROW_ID original (a primeira)
+    # Se houver ROW_ID duplicado, renomeamos e usamos a primeira ocorrência.
+    if isinstance(df_new["ROW_ID"], pd.DataFrame):
+        rid_series = df_new["ROW_ID"].iloc[:, 0]
+    else:
+        rid_series = df_new["ROW_ID"]
+
+    df_new["STATUS"] = [
+        upd_map.get(rid, old_status) for rid, old_status in zip(rid_series.tolist(), df_new["STATUS"].tolist())
+    ]
     return df_new
 
 
@@ -194,6 +241,7 @@ def save_to_github(cfg: GitHubCfg, current_df: pd.DataFrame, context_msg: str = 
         gh_put_file(cfg, new_text=new_text, sha=latest_sha, message=commit_msg)
         st.success("Salvo no GitHub com commit ✅ (retry)")
 
+    # Recarrega
     load_df_from_github.clear()
     df_base2, sha2, raw2 = load_df_from_github(cfg)
     st.session_state["df_work"] = df_base2.copy()
@@ -310,16 +358,14 @@ def view_lista():
     com_pend = resumo[resumo["tem_pendencia"]].copy()
 
     col1, col2 = st.columns(2, vertical_alignment="top")
-
     with col1:
         st.subheader(f"✅ Atletas sem pendências ({len(sem_pend)})")
         st.dataframe(sem_pend.drop(columns=["tem_pendencia"]), use_container_width=True, hide_index=True)
 
-        st.markdown("**Abrir ficha (sem pendências)**")
         atletas_sem = sem_pend["NOME DO ATLETA"].tolist()
         if atletas_sem:
-            atleta_sel = st.selectbox("Selecione", atletas_sem, key="sel_sem")
-            if st.button("Abrir (sem pendências)", use_container_width=True):
+            atleta_sel = st.selectbox("Abrir ficha (sem pendências)", atletas_sem, key="sel_sem")
+            if st.button("Abrir", use_container_width=True, key="btn_sem"):
                 st.session_state["athlete"] = atleta_sel
                 st.session_state["view"] = "ficha"
                 st.rerun()
@@ -330,11 +376,10 @@ def view_lista():
         st.subheader(f"⚠️ Atletas com pendências ({len(com_pend)})")
         st.dataframe(com_pend.drop(columns=["tem_pendencia"]), use_container_width=True, hide_index=True)
 
-        st.markdown("**Abrir ficha (com pendências)**")
         atletas_com = com_pend["NOME DO ATLETA"].tolist()
         if atletas_com:
-            atleta_sel2 = st.selectbox("Selecione", atletas_com, key="sel_com")
-            if st.button("Abrir (com pendências)", type="primary", use_container_width=True):
+            atleta_sel2 = st.selectbox("Abrir ficha (com pendências)", atletas_com, key="sel_com")
+            if st.button("Abrir", type="primary", use_container_width=True, key="btn_com"):
                 st.session_state["athlete"] = atleta_sel2
                 st.session_state["view"] = "ficha"
                 st.rerun()
@@ -359,15 +404,20 @@ def view_ficha():
         if st.button("💾 Salvar no GitHub", type="primary", use_container_width=True):
             save_to_github(cfg, df, context_msg=f"atleta {atleta}")
     with bar3:
-        st.caption("Ordenação: data mais antiga → mais recente. Salvar cria commit no GitHub.")
+        st.caption("Ocorrências ordenadas: data mais antiga → mais recente.")
 
-    mask = df["NOME DO ATLETA"] == atleta
-    df_a = df.loc[mask, ["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
+    # Pegamos somente colunas necessárias, e garantimos que ROW_ID é 1D
+    df_a = df[df["NOME DO ATLETA"] == atleta][["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
 
-    # ✅ Ordenação robusta (evita colisão/duplicidade de nomes como DATA_DT)
+    # Se ROW_ID for duplicado (DataFrame), usa a primeira coluna como Series
+    if isinstance(df_a["ROW_ID"], pd.DataFrame):
+        df_a["__RID__"] = df_a["ROW_ID"].iloc[:, 0]
+    else:
+        df_a["__RID__"] = df_a["ROW_ID"]
+
     df_a["__DATA_SORT__"] = pd.to_datetime(df_a["DATA"], dayfirst=True, errors="coerce")
-    df_a["__ROW_SORT__"] = pd.to_numeric(df_a["ROW_ID"], errors="coerce")
-    df_a = df_a.sort_values(["__DATA_SORT__", "__ROW_SORT__"], ascending=[True, True], na_position="last")
+
+    df_a = df_a.sort_values(["__DATA_SORT__", "__RID__"], ascending=[True, True], na_position="last")
 
     df_show = df_a[["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
 
@@ -390,13 +440,11 @@ def view_ficha():
 
     st.divider()
     c1, c2 = st.columns([1, 1], vertical_alignment="center")
-
     with c1:
         if st.button("Aplicar alterações (sessão)", use_container_width=True):
             st.session_state["df_work"] = apply_status_updates(df, edited)
             st.success("Alterações aplicadas (em memória). Agora você pode salvar no GitHub.")
             st.rerun()
-
     with c2:
         st.download_button(
             "⬇️ Baixar CSV (opcional)",
