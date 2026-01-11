@@ -1,6 +1,5 @@
 import base64
 import json
-import os
 from dataclasses import dataclass
 
 import pandas as pd
@@ -12,7 +11,7 @@ import streamlit as st
 # =========================
 st.set_page_config(page_title="Transferências Internacionais", layout="wide")
 
-STATUS_OPTIONS = ["", "Ok", "Não-Ok"]  # "" = pendente / não marcado
+STATUS_OPTIONS = ["", "Ok", "Não-Ok"]  # "" = pendente
 STATUS_LABELS = {"": "(vazio) Pendente", "Ok": "Ok", "Não-Ok": "Não-Ok"}
 
 
@@ -36,11 +35,11 @@ def get_cfg_from_secrets() -> GitHubCfg:
         token = st.secrets["GITHUB_TOKEN"]
         repo = st.secrets["GITHUB_REPO"]
         branch = st.secrets.get("BRANCH", "main")
-        csv_path = st.secrets.get("CSV_PATH", "Transferencias_Internacionais_ATUALIZADO.csv")
+        csv_path = st.secrets.get("CSV_PATH", "data/transferencias_internacionais.csv")
         return GitHubCfg(token=token, repo=repo, branch=branch, csv_path=csv_path)
     except Exception:
         st.error(
-            "Secrets não configurados. Configure em Streamlit Cloud:\n"
+            "Secrets não configurados. Configure em Streamlit Cloud → Settings → Secrets:\n"
             "GITHUB_TOKEN, GITHUB_REPO, BRANCH (opcional), CSV_PATH."
         )
         st.stop()
@@ -50,22 +49,58 @@ def gh_headers(token: str) -> dict:
     return {
         "Authorization": f"token {token}",
         "Accept": "application/vnd.github+json",
+        "User-Agent": "streamlit-app",
     }
 
 
 def gh_get_file(cfg: GitHubCfg) -> tuple[str, str]:
     """
-    Retorna (conteudo_texto, sha)
+    Retorna (conteudo_texto, sha).
+    Estratégia robusta:
+      1) chama /contents/{path}
+      2) se existir download_url, baixa o conteúdo real por ela (preferido)
+      3) senão, usa o campo base64 'content'
     """
     url = f"https://api.github.com/repos/{cfg.repo}/contents/{cfg.csv_path}"
     r = requests.get(url, headers=gh_headers(cfg.token), params={"ref": cfg.branch}, timeout=30)
     if r.status_code != 200:
-        raise RuntimeError(f"GitHub GET falhou ({r.status_code}): {r.text}")
+        raise RuntimeError(
+            f"GitHub GET falhou ({r.status_code}). Verifique CSV_PATH/BRANCH.\nResposta: {r.text}"
+        )
 
     data = r.json()
-    sha = data["sha"]
-    content_b64 = data["content"]
-    content = base64.b64decode(content_b64).decode("utf-8-sig", errors="replace")
+
+    # Se o path for uma pasta, o GitHub retorna uma lista
+    if isinstance(data, list):
+        raise RuntimeError(
+            f"CSV_PATH parece apontar para uma PASTA, não um arquivo: {cfg.csv_path}"
+        )
+
+    sha = data.get("sha", "")
+    download_url = data.get("download_url")
+
+    # Preferência: baixar pelo download_url (mais confiável para arquivos maiores)
+    if download_url:
+        rr = requests.get(download_url, timeout=60)
+        if rr.status_code != 200:
+            raise RuntimeError(f"Falha ao baixar CSV pelo download_url ({rr.status_code}).")
+        content = rr.content.decode("utf-8-sig", errors="replace")
+    else:
+        # fallback: base64 'content'
+        content_b64 = data.get("content", "")
+        if not content_b64:
+            raise RuntimeError(
+                "GitHub não retornou content nem download_url. "
+                "Isso pode ocorrer em casos específicos (arquivo grande/estranho)."
+            )
+        content = base64.b64decode(content_b64).decode("utf-8-sig", errors="replace")
+
+    if not content.strip():
+        raise RuntimeError(
+            "O conteúdo do CSV vindo do GitHub está vazio.\n"
+            "Confira se o arquivo no repo tem dados e se CSV_PATH está correto."
+        )
+
     return content, sha
 
 
@@ -88,6 +123,8 @@ def load_df_from_github(cfg: GitHubCfg) -> tuple[pd.DataFrame, str, str]:
     Retorna (df, sha, raw_text)
     """
     raw_text, sha = gh_get_file(cfg)
+
+    # Aqui é onde estava estourando "No columns..." quando raw_text vinha vazio
     df = pd.read_csv(pd.io.common.StringIO(raw_text))
 
     required = ["NOME DO ATLETA", "DE", "PARA", "PAÍS", "DATA", "STATUS"]
@@ -105,7 +142,6 @@ def load_df_from_github(cfg: GitHubCfg) -> tuple[pd.DataFrame, str, str]:
 
 def dataframe_to_csv_text(df_full: pd.DataFrame) -> str:
     df_out = df_full.drop(columns=["DATA_DT", "ANO"], errors="ignore").copy()
-    # utf-8-sig ajuda no Excel
     return df_out.to_csv(index=False, encoding="utf-8-sig")
 
 
@@ -140,23 +176,72 @@ def build_resumo_por_atleta(df_in: pd.DataFrame) -> pd.DataFrame:
     return resumo
 
 
+def apply_filters_for_list(df_in: pd.DataFrame, ano_sel, status_sel, busca) -> pd.DataFrame:
+    df_f = df_in.copy()
+
+    if ano_sel != "Todos":
+        df_f = df_f[df_f["ANO"] == int(ano_sel)]
+
+    if status_sel:
+        df_f = df_f[df_f["STATUS"].isin(status_sel)]
+    else:
+        df_f = df_f.iloc[0:0]
+
+    if busca:
+        df_f = df_f[df_f["NOME DO ATLETA"].str.contains(busca, case=False, na=False)]
+
+    return df_f
+
+
+def save_to_github(cfg: GitHubCfg, current_df: pd.DataFrame, context_msg: str = "") -> None:
+    new_text = dataframe_to_csv_text(current_df)
+
+    if new_text.strip() == st.session_state["_gh_raw"].strip():
+        st.info("Nenhuma alteração detectada para salvar.")
+        return
+
+    commit_msg = "Atualiza STATUS via app Streamlit"
+    if context_msg:
+        commit_msg += f" - {context_msg}"
+
+    # 1) tenta com sha atual
+    try:
+        gh_put_file(cfg, new_text=new_text, sha=st.session_state["_gh_sha"], message=commit_msg)
+        st.success("Salvo no GitHub com commit ✅")
+    except Exception:
+        # 2) retry com sha mais recente
+        st.warning("Arquivo mudou no GitHub. Tentando novamente com SHA mais recente...")
+        latest_raw, latest_sha = gh_get_file(cfg)
+        gh_put_file(cfg, new_text=new_text, sha=latest_sha, message=commit_msg)
+        st.success("Salvo no GitHub com commit ✅ (retry)")
+
+    # Recarrega
+    load_df_from_github.clear()
+    df_base2, sha2, raw2 = load_df_from_github(cfg)
+    st.session_state["df_work"] = df_base2.copy()
+    st.session_state["_gh_sha"] = sha2
+    st.session_state["_gh_raw"] = raw2
+    st.session_state["view"] = "lista"
+    st.rerun()
+
+
 # =========================
-# Estado da sessão
+# Session state init
 # =========================
 if "view" not in st.session_state:
-    st.session_state.view = "lista"
+    st.session_state["view"] = "lista"
 if "athlete" not in st.session_state:
-    st.session_state.athlete = ""
+    st.session_state["athlete"] = ""
 if "df_work" not in st.session_state:
-    st.session_state.df_work = None
+    st.session_state["df_work"] = None
 if "_gh_sha" not in st.session_state:
-    st.session_state._gh_sha = ""
+    st.session_state["_gh_sha"] = ""
 if "_gh_raw" not in st.session_state:
-    st.session_state._gh_raw = ""
+    st.session_state["_gh_raw"] = ""
 
 
 # =========================
-# Carrega do GitHub
+# Load GitHub
 # =========================
 cfg = get_cfg_from_secrets()
 
@@ -166,22 +251,21 @@ except Exception as e:
     st.error(f"Erro ao carregar do GitHub: {e}")
     st.stop()
 
-# Inicializa sessão com base do GitHub
-if st.session_state.df_work is None:
-    st.session_state.df_work = df_base.copy()
-    st.session_state._gh_sha = sha_base
-    st.session_state._gh_raw = raw_base
+if st.session_state["df_work"] is None:
+    st.session_state["df_work"] = df_base.copy()
+    st.session_state["_gh_sha"] = sha_base
+    st.session_state["_gh_raw"] = raw_base
 
-df = st.session_state.df_work
+df = st.session_state["df_work"]
 
 
 # =========================
-# Sidebar - Filtros e ações
+# Sidebar
 # =========================
 st.sidebar.header("Fonte")
 st.sidebar.write(f"Repo: `{cfg.repo}`")
 st.sidebar.write(f"Branch: `{cfg.branch}`")
-st.sidebar.write(f"Arquivo: `{cfg.csv_path}`")
+st.sidebar.write(f"CSV_PATH: `{cfg.csv_path}`")
 
 st.sidebar.divider()
 st.sidebar.header("Filtros")
@@ -199,83 +283,23 @@ status_sel = st.sidebar.multiselect(
 busca = st.sidebar.text_input("Buscar atleta (contém)", value="").strip()
 
 st.sidebar.divider()
-colA, colB = st.sidebar.columns(2)
-
-with colA:
+cA, cB = st.sidebar.columns(2)
+with cA:
     if st.button("Recarregar do GitHub", use_container_width=True):
         load_df_from_github.clear()
         df_base2, sha2, raw2 = load_df_from_github(cfg)
-        st.session_state.df_work = df_base2.copy()
-        st.session_state._gh_sha = sha2
-        st.session_state._gh_raw = raw2
-        st.session_state.view = "lista"
-        st.session_state.athlete = ""
+        st.session_state["df_work"] = df_base2.copy()
+        st.session_state["_gh_sha"] = sha2
+        st.session_state["_gh_raw"] = raw2
+        st.session_state["view"] = "lista"
+        st.session_state["athlete"] = ""
         st.rerun()
-
-with colB:
+with cB:
     if st.button("Ir p/ Lista", use_container_width=True):
-        st.session_state.view = "lista"
+        st.session_state["view"] = "lista"
         st.rerun()
 
 st.sidebar.caption("Pendente = STATUS vazio")
-
-
-def apply_filters_for_list(df_in: pd.DataFrame) -> pd.DataFrame:
-    df_f = df_in.copy()
-
-    if ano_sel != "Todos":
-        df_f = df_f[df_f["ANO"] == int(ano_sel)]
-
-    if status_sel:
-        df_f = df_f[df_f["STATUS"].isin(status_sel)]
-    else:
-        df_f = df_f.iloc[0:0]
-
-    if busca:
-        df_f = df_f[df_f["NOME DO ATLETA"].str.contains(busca, case=False, na=False)]
-
-    return df_f
-
-
-def save_to_github(current_df: pd.DataFrame, context_msg: str = "") -> None:
-    """
-    Salva o CSV atual no GitHub com commit.
-    Faz 1 tentativa de retry se o sha estiver desatualizado.
-    """
-    new_text = dataframe_to_csv_text(current_df)
-
-    # Evita commit se não mudou nada em relação ao último raw carregado
-    if new_text.strip() == st.session_state._gh_raw.strip():
-        st.info("Nenhuma alteração detectada para salvar.")
-        return
-
-    commit_msg = "Atualiza STATUS via app Streamlit"
-    if context_msg:
-        commit_msg += f" - {context_msg}"
-
-    # 1) tenta com sha que temos
-    try:
-        gh_put_file(cfg, new_text=new_text, sha=st.session_state._gh_sha, message=commit_msg)
-        st.success("Salvo no GitHub com commit ✅")
-    except Exception as e1:
-        # 2) retry: recarrega sha atual e tenta salvar novamente
-        st.warning("O arquivo parece ter mudado no GitHub. Tentando salvar novamente com o SHA mais recente...")
-        try:
-            latest_raw, latest_sha = gh_get_file(cfg)
-            gh_put_file(cfg, new_text=new_text, sha=latest_sha, message=commit_msg)
-            st.success("Salvo no GitHub com commit ✅ (retry)")
-        except Exception as e2:
-            st.error(f"Falha ao salvar no GitHub. Detalhes:\n\n{e2}")
-            return
-
-    # Recarrega a base do GitHub para atualizar sha/raw e manter tudo consistente
-    load_df_from_github.clear()
-    df_base2, sha2, raw2 = load_df_from_github(cfg)
-    st.session_state.df_work = df_base2.copy()
-    st.session_state._gh_sha = sha2
-    st.session_state._gh_raw = raw2
-    st.session_state.view = "lista"
-    st.rerun()
 
 
 # =========================
@@ -284,29 +308,13 @@ def save_to_github(current_df: pd.DataFrame, context_msg: str = "") -> None:
 def view_lista():
     st.title("Transferências Internacionais — Atletas")
 
-    df_f = apply_filters_for_list(df)
-
+    df_f = apply_filters_for_list(df, ano_sel, status_sel, busca)
     resumo = build_resumo_por_atleta(df_f)
-    if resumo.empty:
-        st.info("Nenhum atleta encontrado com os filtros atuais.")
-        st.download_button(
-            "⬇️ Baixar CSV atualizado (sessão)",
-            data=dataframe_to_csv_bytes(df),
-            file_name="Transferencias_Internacionais_ATUALIZADO.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
-        return
-
-    resumo = resumo.sort_values(["tem_pendencia", "ocorrencias", "NOME DO ATLETA"], ascending=[False, False, True])
-
-    sem_pend = resumo[~resumo["tem_pendencia"]].copy()
-    com_pend = resumo[resumo["tem_pendencia"]].copy()
 
     top1, top2, top3 = st.columns([1, 1, 2], vertical_alignment="center")
     with top1:
         if st.button("💾 Salvar no GitHub", type="primary", use_container_width=True):
-            save_to_github(df, context_msg="lista")
+            save_to_github(cfg, df, context_msg="lista")
     with top2:
         st.download_button(
             "⬇️ Baixar CSV (opcional)",
@@ -316,53 +324,53 @@ def view_lista():
             use_container_width=True,
         )
     with top3:
-        st.caption("Dica: clique em “Salvar no GitHub” para gravar definitivamente sem baixar/subir arquivo.")
+        st.caption("Salvar no GitHub grava definitivamente o CSV no repositório (commit).")
+
+    if resumo.empty:
+        st.info("Nenhum atleta encontrado com os filtros atuais.")
+        return
+
+    resumo = resumo.sort_values(["tem_pendencia", "ocorrencias", "NOME DO ATLETA"], ascending=[False, False, True])
+    sem_pend = resumo[~resumo["tem_pendencia"]].copy()
+    com_pend = resumo[resumo["tem_pendencia"]].copy()
 
     col1, col2 = st.columns(2, vertical_alignment="top")
 
     with col1:
         st.subheader(f"✅ Atletas sem pendências ({len(sem_pend)})")
-        st.dataframe(
-            sem_pend.drop(columns=["tem_pendencia"]),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(sem_pend.drop(columns=["tem_pendencia"]), use_container_width=True, hide_index=True)
 
         st.markdown("**Abrir ficha (sem pendências)**")
         atletas_sem = sem_pend["NOME DO ATLETA"].tolist()
         if atletas_sem:
             atleta_sel = st.selectbox("Selecione", atletas_sem, key="sel_sem")
             if st.button("Abrir (sem pendências)", use_container_width=True):
-                st.session_state.athlete = atleta_sel
-                st.session_state.view = "ficha"
+                st.session_state["athlete"] = atleta_sel
+                st.session_state["view"] = "ficha"
                 st.rerun()
         else:
             st.caption("Nenhum atleta sem pendências com os filtros atuais.")
 
     with col2:
         st.subheader(f"⚠️ Atletas com pendências ({len(com_pend)})")
-        st.dataframe(
-            com_pend.drop(columns=["tem_pendencia"]),
-            use_container_width=True,
-            hide_index=True,
-        )
+        st.dataframe(com_pend.drop(columns=["tem_pendencia"]), use_container_width=True, hide_index=True)
 
         st.markdown("**Abrir ficha (com pendências)**")
         atletas_com = com_pend["NOME DO ATLETA"].tolist()
         if atletas_com:
             atleta_sel2 = st.selectbox("Selecione", atletas_com, key="sel_com")
             if st.button("Abrir (com pendências)", type="primary", use_container_width=True):
-                st.session_state.athlete = atleta_sel2
-                st.session_state.view = "ficha"
+                st.session_state["athlete"] = atleta_sel2
+                st.session_state["view"] = "ficha"
                 st.rerun()
         else:
             st.caption("Nenhum atleta com pendências com os filtros atuais.")
 
 
 def view_ficha():
-    atleta = st.session_state.athlete
+    atleta = st.session_state["athlete"]
     if not atleta:
-        st.session_state.view = "lista"
+        st.session_state["view"] = "lista"
         st.rerun()
 
     st.title(f"Ficha do atleta: {atleta}")
@@ -370,22 +378,19 @@ def view_ficha():
     bar1, bar2, bar3 = st.columns([1, 1, 2], vertical_alignment="center")
     with bar1:
         if st.button("← Voltar", use_container_width=True):
-            st.session_state.view = "lista"
+            st.session_state["view"] = "lista"
             st.rerun()
     with bar2:
         if st.button("💾 Salvar no GitHub", type="primary", use_container_width=True):
-            save_to_github(df, context_msg=f"atleta {atleta}")
+            save_to_github(cfg, df, context_msg=f"atleta {atleta}")
     with bar3:
-        st.caption("Ordenação: da data mais antiga para a mais recente. Salvar grava no GitHub com commit.")
+        st.caption("Ocorrências ordenadas: data mais antiga → mais recente. Salvar cria commit no GitHub.")
 
     mask = df["NOME DO ATLETA"] == atleta
     df_a = df.loc[mask, ["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "DATA_DT", "STATUS"]].copy()
-
-    # Requisito: ordenar do mais antigo para o mais recente (NaT no fim)
     df_a = df_a.sort_values(["DATA_DT", "ROW_ID"], ascending=[True, True], na_position="last")
-    df_show = df_a[["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
 
-    st.caption(f"Ocorrências encontradas: **{len(df_show)}**")
+    df_show = df_a[["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
 
     edited = st.data_editor(
         df_show,
@@ -408,8 +413,8 @@ def view_ficha():
     c1, c2 = st.columns([1, 1], vertical_alignment="center")
 
     with c1:
-        if st.button("Aplicar alterações (sessão)", type="secondary", use_container_width=True):
-            st.session_state.df_work = apply_status_updates(df, edited)
+        if st.button("Aplicar alterações (sessão)", use_container_width=True):
+            st.session_state["df_work"] = apply_status_updates(df, edited)
             st.success("Alterações aplicadas (em memória). Agora você pode salvar no GitHub.")
             st.rerun()
 
@@ -423,10 +428,8 @@ def view_ficha():
         )
 
 
-# =========================
 # Router
-# =========================
-if st.session_state.view == "lista":
+if st.session_state["view"] == "lista":
     view_lista()
 else:
     view_ficha()
