@@ -25,9 +25,9 @@ def normalize_status(x) -> str:
 @dataclass
 class GitHubCfg:
     token: str
-    repo: str      # "user/repo"
-    branch: str    # "main"
-    csv_path: str  # "arquivo.csv"
+    repo: str
+    branch: str
+    csv_path: str
 
 
 def get_cfg_from_secrets() -> GitHubCfg:
@@ -40,7 +40,7 @@ def get_cfg_from_secrets() -> GitHubCfg:
     except Exception:
         st.error(
             "Secrets não configurados. Configure em Streamlit Cloud → Settings → Secrets:\n"
-            'GITHUB_TOKEN, GITHUB_REPO, BRANCH (opcional), CSV_PATH (opcional).'
+            "GITHUB_TOKEN, GITHUB_REPO, BRANCH (opcional), CSV_PATH."
         )
         st.stop()
 
@@ -54,10 +54,6 @@ def gh_headers(token: str) -> dict:
 
 
 def gh_get_file(cfg: GitHubCfg) -> tuple[str, str]:
-    """
-    Retorna (conteudo_texto, sha).
-    Baixa via download_url (mais robusto) quando disponível.
-    """
     url = f"https://api.github.com/repos/{cfg.repo}/contents/{cfg.csv_path}"
     r = requests.get(url, headers=gh_headers(cfg.token), params={"ref": cfg.branch}, timeout=30)
     if r.status_code != 200:
@@ -84,7 +80,7 @@ def gh_get_file(cfg: GitHubCfg) -> tuple[str, str]:
         content = base64.b64decode(content_b64).decode("utf-8-sig", errors="replace")
 
     if not content.strip():
-        raise RuntimeError("Conteúdo do CSV no GitHub está vazio. Confira o arquivo no repo.")
+        raise RuntimeError("Conteúdo do CSV no GitHub está vazio.")
     return content, sha
 
 
@@ -104,8 +100,10 @@ def gh_put_file(cfg: GitHubCfg, new_text: str, sha: str, message: str) -> None:
 @st.cache_data(show_spinner=False)
 def load_df_from_github(cfg: GitHubCfg) -> tuple[pd.DataFrame, str, str]:
     raw_text, sha = gh_get_file(cfg)
-
     df = pd.read_csv(pd.io.common.StringIO(raw_text))
+
+    # Remove colunas duplicadas por nome (segurança extra)
+    df = df.loc[:, ~pd.Index(df.columns).duplicated()].copy()
 
     required = ["NOME DO ATLETA", "DE", "PARA", "PAÍS", "DATA", "STATUS"]
     missing = [c for c in required if c not in df.columns]
@@ -116,13 +114,14 @@ def load_df_from_github(cfg: GitHubCfg) -> tuple[pd.DataFrame, str, str]:
     df["ANO"] = df["DATA_DT"].dt.year
     df["STATUS"] = df["STATUS"].apply(normalize_status)
 
-    # ID estável baseado na ordem do arquivo atual
     df = df.reset_index(drop=False).rename(columns={"index": "ROW_ID"})
     return df, sha, raw_text
 
 
 def dataframe_to_csv_text(df_full: pd.DataFrame) -> str:
     df_out = df_full.drop(columns=["DATA_DT", "ANO"], errors="ignore").copy()
+    # Também remove duplicadas antes de salvar
+    df_out = df_out.loc[:, ~pd.Index(df_out.columns).duplicated()].copy()
     return df_out.to_csv(index=False, encoding="utf-8-sig")
 
 
@@ -134,24 +133,19 @@ def apply_status_updates(df_full: pd.DataFrame, edited_rows: pd.DataFrame) -> pd
     df_new = df_full.copy()
     upd = edited_rows[["ROW_ID", "STATUS"]].copy()
     upd["STATUS"] = upd["STATUS"].apply(normalize_status)
-
     upd_map = dict(zip(upd["ROW_ID"], upd["STATUS"]))
+
     df_new["STATUS"] = df_new.apply(lambda r: upd_map.get(r["ROW_ID"], r["STATUS"]), axis=1)
     return df_new
 
 
-# ✅ CORREÇÃO DO ERRO: não usar ("ROW_ID","count") no agg
 def build_resumo_por_atleta(df_in: pd.DataFrame) -> pd.DataFrame:
-    """
-    Versão robusta contra bug/edge-case do pandas com count em alguns ambientes.
-    Usa groupby.size() + agregações no STATUS.
-    """
     if df_in.empty:
         return pd.DataFrame(columns=["NOME DO ATLETA", "ocorrencias", "ok", "nao_ok", "pendente", "tem_pendencia"])
 
     g = df_in.groupby("NOME DO ATLETA", dropna=False)
 
-    ocorr = g.size().rename("ocorrencias")  # <- robusto
+    ocorr = g.size().rename("ocorrencias")
     stats = g["STATUS"].agg(
         ok=lambda s: (s == "Ok").sum(),
         nao_ok=lambda s: (s == "Não-Ok").sum(),
@@ -191,7 +185,6 @@ def save_to_github(cfg: GitHubCfg, current_df: pd.DataFrame, context_msg: str = 
     if context_msg:
         commit_msg += f" - {context_msg}"
 
-    # tenta com SHA atual; se falhar, faz retry com SHA mais recente
     try:
         gh_put_file(cfg, new_text=new_text, sha=st.session_state["_gh_sha"], message=commit_msg)
         st.success("Salvo no GitHub com commit ✅")
@@ -201,7 +194,6 @@ def save_to_github(cfg: GitHubCfg, current_df: pd.DataFrame, context_msg: str = 
         gh_put_file(cfg, new_text=new_text, sha=latest_sha, message=commit_msg)
         st.success("Salvo no GitHub com commit ✅ (retry)")
 
-    # Recarrega para manter sha/raw e df consistentes
     load_df_from_github.clear()
     df_base2, sha2, raw2 = load_df_from_github(cfg)
     st.session_state["df_work"] = df_base2.copy()
@@ -243,7 +235,6 @@ if st.session_state["df_work"] is None:
     st.session_state["_gh_raw"] = raw_base
 
 df = st.session_state["df_work"]
-
 
 # =========================
 # Sidebar
@@ -368,11 +359,15 @@ def view_ficha():
         if st.button("💾 Salvar no GitHub", type="primary", use_container_width=True):
             save_to_github(cfg, df, context_msg=f"atleta {atleta}")
     with bar3:
-        st.caption("Ocorrências ordenadas: data mais antiga → mais recente. Salvar cria commit no GitHub.")
+        st.caption("Ordenação: data mais antiga → mais recente. Salvar cria commit no GitHub.")
 
     mask = df["NOME DO ATLETA"] == atleta
-    df_a = df.loc[mask, ["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "DATA_DT", "STATUS"]].copy()
-    df_a = df_a.sort_values(["DATA_DT", "ROW_ID"], ascending=[True, True], na_position="last")
+    df_a = df.loc[mask, ["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
+
+    # ✅ Ordenação robusta (evita colisão/duplicidade de nomes como DATA_DT)
+    df_a["__DATA_SORT__"] = pd.to_datetime(df_a["DATA"], dayfirst=True, errors="coerce")
+    df_a["__ROW_SORT__"] = pd.to_numeric(df_a["ROW_ID"], errors="coerce")
+    df_a = df_a.sort_values(["__DATA_SORT__", "__ROW_SORT__"], ascending=[True, True], na_position="last")
 
     df_show = df_a[["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
 
