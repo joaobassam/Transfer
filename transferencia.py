@@ -25,7 +25,7 @@ def normalize_status(x) -> str:
 def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     Renomeia colunas duplicadas adicionando sufixos __2, __3...
-    Isso evita bugs onde df['COL'] vira DataFrame em vez de Series.
+    Garante nomes únicos (necessário para st.data_editor).
     """
     cols = list(df.columns)
     seen = {}
@@ -37,9 +37,20 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
         else:
             seen[c] += 1
             new_cols.append(f"{c}__{seen[c]}")
-    df = df.copy()
-    df.columns = new_cols
-    return df
+    out = df.copy()
+    out.columns = new_cols
+    return out
+
+
+def first_col_as_series(df: pd.DataFrame, colname: str) -> pd.Series:
+    """
+    Se df[colname] retornar DataFrame (colunas duplicadas), pega a primeira coluna como Series.
+    Caso contrário, retorna a Series.
+    """
+    obj = df[colname]
+    if isinstance(obj, pd.DataFrame):
+        return obj.iloc[:, 0]
+    return obj
 
 
 @dataclass
@@ -122,19 +133,17 @@ def load_df_from_github(cfg: GitHubCfg) -> tuple[pd.DataFrame, str, str]:
     raw_text, sha = gh_get_file(cfg)
 
     df = pd.read_csv(pd.io.common.StringIO(raw_text))
-    df = dedupe_columns(df)  # evita qualquer duplicidade vindo do CSV
+    df = dedupe_columns(df)
 
     required = ["NOME DO ATLETA", "DE", "PARA", "PAÍS", "DATA", "STATUS"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"CSV não contém colunas esperadas: {missing}")
 
-    # Auxiliares
     df["DATA_DT"] = pd.to_datetime(df["DATA"], dayfirst=True, errors="coerce")
     df["ANO"] = df["DATA_DT"].dt.year
     df["STATUS"] = df["STATUS"].apply(normalize_status)
 
-    # Cria ROW_ID e depois dedupe (por segurança máxima)
     df = df.reset_index(drop=False).rename(columns={"index": "ROW_ID"})
     df = dedupe_columns(df)
 
@@ -145,9 +154,7 @@ def dataframe_to_csv_text(df_full: pd.DataFrame) -> str:
     df_out = df_full.drop(columns=["DATA_DT", "ANO"], errors="ignore").copy()
     df_out = dedupe_columns(df_out)
 
-    # IMPORTANTE:
-    # Se existirem colunas ROW_ID__2 etc, elas vieram de alguma duplicidade; não devem ir pro CSV final.
-    # Mantemos apenas a primeira ROW_ID, e eliminamos as duplicadas.
+    # Mantém apenas a primeira ocorrência de cada "base" (antes de __N)
     cols_keep = []
     seen_base = set()
     for c in df_out.columns:
@@ -168,37 +175,26 @@ def dataframe_to_csv_bytes(df_full: pd.DataFrame) -> bytes:
 def apply_status_updates(df_full: pd.DataFrame, edited_rows: pd.DataFrame) -> pd.DataFrame:
     df_new = df_full.copy()
 
-    # edited_rows sempre tem ROW_ID "simples" (1 coluna)
     upd = edited_rows[["ROW_ID", "STATUS"]].copy()
     upd["STATUS"] = upd["STATUS"].apply(normalize_status)
     upd_map = dict(zip(upd["ROW_ID"], upd["STATUS"]))
 
-    # Aqui garantimos que usamos a coluna ROW_ID original (a primeira)
-    # Se houver ROW_ID duplicado, renomeamos e usamos a primeira ocorrência.
-    if isinstance(df_new["ROW_ID"], pd.DataFrame):
-        rid_series = df_new["ROW_ID"].iloc[:, 0]
-    else:
-        rid_series = df_new["ROW_ID"]
-
-    df_new["STATUS"] = [
-        upd_map.get(rid, old_status) for rid, old_status in zip(rid_series.tolist(), df_new["STATUS"].tolist())
-    ]
+    rid = first_col_as_series(df_new, "ROW_ID").tolist()
+    old = df_new["STATUS"].tolist()
+    df_new["STATUS"] = [upd_map.get(r, s) for r, s in zip(rid, old)]
     return df_new
 
 
 def build_resumo_por_atleta(df_in: pd.DataFrame) -> pd.DataFrame:
     if df_in.empty:
         return pd.DataFrame(columns=["NOME DO ATLETA", "ocorrencias", "ok", "nao_ok", "pendente", "tem_pendencia"])
-
     g = df_in.groupby("NOME DO ATLETA", dropna=False)
-
     ocorr = g.size().rename("ocorrencias")
     stats = g["STATUS"].agg(
         ok=lambda s: (s == "Ok").sum(),
         nao_ok=lambda s: (s == "Não-Ok").sum(),
         pendente=lambda s: (s == "").sum(),
     )
-
     resumo = pd.concat([ocorr, stats], axis=1).reset_index()
     resumo["tem_pendencia"] = resumo["pendente"] > 0
     return resumo
@@ -206,18 +202,14 @@ def build_resumo_por_atleta(df_in: pd.DataFrame) -> pd.DataFrame:
 
 def apply_filters_for_list(df_in: pd.DataFrame, ano_sel, status_sel, busca) -> pd.DataFrame:
     df_f = df_in.copy()
-
     if ano_sel != "Todos":
         df_f = df_f[df_f["ANO"] == int(ano_sel)]
-
     if status_sel:
         df_f = df_f[df_f["STATUS"].isin(status_sel)]
     else:
         df_f = df_f.iloc[0:0]
-
     if busca:
         df_f = df_f[df_f["NOME DO ATLETA"].str.contains(busca, case=False, na=False)]
-
     return df_f
 
 
@@ -241,7 +233,6 @@ def save_to_github(cfg: GitHubCfg, current_df: pd.DataFrame, context_msg: str = 
         gh_put_file(cfg, new_text=new_text, sha=latest_sha, message=commit_msg)
         st.success("Salvo no GitHub com commit ✅ (retry)")
 
-    # Recarrega
     load_df_from_github.clear()
     df_base2, sha2, raw2 = load_df_from_github(cfg)
     st.session_state["df_work"] = df_base2.copy()
@@ -254,17 +245,15 @@ def save_to_github(cfg: GitHubCfg, current_df: pd.DataFrame, context_msg: str = 
 # =========================
 # Session state init
 # =========================
-if "view" not in st.session_state:
-    st.session_state["view"] = "lista"
-if "athlete" not in st.session_state:
-    st.session_state["athlete"] = ""
-if "df_work" not in st.session_state:
-    st.session_state["df_work"] = None
-if "_gh_sha" not in st.session_state:
-    st.session_state["_gh_sha"] = ""
-if "_gh_raw" not in st.session_state:
-    st.session_state["_gh_raw"] = ""
-
+for k, v in {
+    "view": "lista",
+    "athlete": "",
+    "df_work": None,
+    "_gh_sha": "",
+    "_gh_raw": "",
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # =========================
 # Load GitHub
@@ -369,8 +358,6 @@ def view_lista():
                 st.session_state["athlete"] = atleta_sel
                 st.session_state["view"] = "ficha"
                 st.rerun()
-        else:
-            st.caption("Nenhum atleta sem pendências com os filtros atuais.")
 
     with col2:
         st.subheader(f"⚠️ Atletas com pendências ({len(com_pend)})")
@@ -383,8 +370,6 @@ def view_lista():
                 st.session_state["athlete"] = atleta_sel2
                 st.session_state["view"] = "ficha"
                 st.rerun()
-        else:
-            st.caption("Nenhum atleta com pendências com os filtros atuais.")
 
 
 def view_ficha():
@@ -406,20 +391,23 @@ def view_ficha():
     with bar3:
         st.caption("Ocorrências ordenadas: data mais antiga → mais recente.")
 
-    # Pegamos somente colunas necessárias, e garantimos que ROW_ID é 1D
-    df_a = df[df["NOME DO ATLETA"] == atleta][["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
+    base = df[df["NOME DO ATLETA"] == atleta].copy()
 
-    # Se ROW_ID for duplicado (DataFrame), usa a primeira coluna como Series
-    if isinstance(df_a["ROW_ID"], pd.DataFrame):
-        df_a["__RID__"] = df_a["ROW_ID"].iloc[:, 0]
-    else:
-        df_a["__RID__"] = df_a["ROW_ID"]
+    # Garante que ROW_ID é 1D (Series) e cria uma coluna "ROW_ID" única para exibição
+    rid_series = first_col_as_series(base, "ROW_ID")
+    base = base.copy()
+    base["ROW_ID"] = rid_series
 
+    df_a = base[["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
+
+    # Ordenação robusta
     df_a["__DATA_SORT__"] = pd.to_datetime(df_a["DATA"], dayfirst=True, errors="coerce")
-
+    df_a["__RID__"] = pd.to_numeric(df_a["ROW_ID"], errors="coerce")
     df_a = df_a.sort_values(["__DATA_SORT__", "__RID__"], ascending=[True, True], na_position="last")
 
+    # O data_editor NÃO aceita colunas duplicadas
     df_show = df_a[["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
+    df_show = dedupe_columns(df_show)
 
     edited = st.data_editor(
         df_show,
@@ -460,3 +448,4 @@ if st.session_state["view"] == "lista":
     view_lista()
 else:
     view_ficha()
+
