@@ -6,12 +6,9 @@ import pandas as pd
 import requests
 import streamlit as st
 
-# =========================
-# Config UI
-# =========================
 st.set_page_config(page_title="Transferências Internacionais", layout="wide")
 
-STATUS_OPTIONS = ["", "Ok", "Não-Ok"]  # "" = pendente
+STATUS_OPTIONS = ["", "Ok", "Não-Ok"]
 STATUS_LABELS = {"": "(vazio) Pendente", "Ok": "Ok", "Não-Ok": "Não-Ok"}
 
 
@@ -23,10 +20,6 @@ def normalize_status(x) -> str:
 
 
 def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Renomeia colunas duplicadas adicionando sufixos __2, __3...
-    Garante nomes únicos (necessário para st.data_editor).
-    """
     cols = list(df.columns)
     seen = {}
     new_cols = []
@@ -43,14 +36,27 @@ def dedupe_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def first_col_as_series(df: pd.DataFrame, colname: str) -> pd.Series:
-    """
-    Se df[colname] retornar DataFrame (colunas duplicadas), pega a primeira coluna como Series.
-    Caso contrário, retorna a Series.
-    """
     obj = df[colname]
     if isinstance(obj, pd.DataFrame):
         return obj.iloc[:, 0]
     return obj
+
+
+def collapse_to_base_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Mantém apenas a primeira ocorrência de cada "base" (antes de __N).
+    Ex.: ROW_ID e ROW_ID__2 -> fica só ROW_ID.
+    """
+    df = dedupe_columns(df)
+    cols_keep = []
+    seen_base = set()
+    for c in df.columns:
+        base = c.split("__")[0]
+        if base in seen_base:
+            continue
+        seen_base.add(base)
+        cols_keep.append(c)
+    return df[cols_keep].copy()
 
 
 @dataclass
@@ -63,11 +69,12 @@ class GitHubCfg:
 
 def get_cfg_from_secrets() -> GitHubCfg:
     try:
-        token = st.secrets["GITHUB_TOKEN"]
-        repo = st.secrets["GITHUB_REPO"]
-        branch = st.secrets.get("BRANCH", "main")
-        csv_path = st.secrets.get("CSV_PATH", "Transferencias_Internacionais_ATUALIZADO.csv")
-        return GitHubCfg(token=token, repo=repo, branch=branch, csv_path=csv_path)
+        return GitHubCfg(
+            token=st.secrets["GITHUB_TOKEN"],
+            repo=st.secrets["GITHUB_REPO"],
+            branch=st.secrets.get("BRANCH", "main"),
+            csv_path=st.secrets.get("CSV_PATH", "Transferencias_Internacionais_ATUALIZADO.csv"),
+        )
     except Exception:
         st.error(
             "Secrets não configurados. Configure em Streamlit Cloud → Settings → Secrets:\n"
@@ -88,13 +95,11 @@ def gh_get_file(cfg: GitHubCfg) -> tuple[str, str]:
     url = f"https://api.github.com/repos/{cfg.repo}/contents/{cfg.csv_path}"
     r = requests.get(url, headers=gh_headers(cfg.token), params={"ref": cfg.branch}, timeout=30)
     if r.status_code != 200:
-        raise RuntimeError(
-            f"GitHub GET falhou ({r.status_code}). Verifique CSV_PATH/BRANCH.\nResposta: {r.text}"
-        )
+        raise RuntimeError(f"GitHub GET falhou ({r.status_code}). Resposta: {r.text}")
 
     data = r.json()
     if isinstance(data, list):
-        raise RuntimeError(f"CSV_PATH aponta para uma pasta, não um arquivo: {cfg.csv_path}")
+        raise RuntimeError(f"CSV_PATH aponta para pasta, não arquivo: {cfg.csv_path}")
 
     sha = data.get("sha", "")
     download_url = data.get("download_url")
@@ -133,7 +138,7 @@ def load_df_from_github(cfg: GitHubCfg) -> tuple[pd.DataFrame, str, str]:
     raw_text, sha = gh_get_file(cfg)
 
     df = pd.read_csv(pd.io.common.StringIO(raw_text))
-    df = dedupe_columns(df)
+    df = collapse_to_base_columns(df)  # <- elimina duplicadas logo no início
 
     required = ["NOME DO ATLETA", "DE", "PARA", "PAÍS", "DATA", "STATUS"]
     missing = [c for c in required if c not in df.columns]
@@ -145,26 +150,14 @@ def load_df_from_github(cfg: GitHubCfg) -> tuple[pd.DataFrame, str, str]:
     df["STATUS"] = df["STATUS"].apply(normalize_status)
 
     df = df.reset_index(drop=False).rename(columns={"index": "ROW_ID"})
-    df = dedupe_columns(df)
+    df = collapse_to_base_columns(df)  # <- garante ROW_ID único
 
     return df, sha, raw_text
 
 
 def dataframe_to_csv_text(df_full: pd.DataFrame) -> str:
     df_out = df_full.drop(columns=["DATA_DT", "ANO"], errors="ignore").copy()
-    df_out = dedupe_columns(df_out)
-
-    # Mantém apenas a primeira ocorrência de cada "base" (antes de __N)
-    cols_keep = []
-    seen_base = set()
-    for c in df_out.columns:
-        base = c.split("__")[0]
-        if base in seen_base:
-            continue
-        seen_base.add(base)
-        cols_keep.append(c)
-    df_out = df_out[cols_keep].copy()
-
+    df_out = collapse_to_base_columns(df_out)
     return df_out.to_csv(index=False, encoding="utf-8-sig")
 
 
@@ -173,15 +166,14 @@ def dataframe_to_csv_bytes(df_full: pd.DataFrame) -> bytes:
 
 
 def apply_status_updates(df_full: pd.DataFrame, edited_rows: pd.DataFrame) -> pd.DataFrame:
-    df_new = df_full.copy()
+    df_new = collapse_to_base_columns(df_full.copy())
 
     upd = edited_rows[["ROW_ID", "STATUS"]].copy()
     upd["STATUS"] = upd["STATUS"].apply(normalize_status)
     upd_map = dict(zip(upd["ROW_ID"], upd["STATUS"]))
 
-    rid = first_col_as_series(df_new, "ROW_ID").tolist()
-    old = df_new["STATUS"].tolist()
-    df_new["STATUS"] = [upd_map.get(r, s) for r, s in zip(rid, old)]
+    rid_series = first_col_as_series(df_new, "ROW_ID")
+    df_new["STATUS"] = [upd_map.get(rid, old) for rid, old in zip(rid_series.tolist(), df_new["STATUS"].tolist())]
     return df_new
 
 
@@ -255,9 +247,6 @@ for k, v in {
     if k not in st.session_state:
         st.session_state[k] = v
 
-# =========================
-# Load GitHub
-# =========================
 cfg = get_cfg_from_secrets()
 
 try:
@@ -266,10 +255,14 @@ except Exception as e:
     st.error(f"Erro ao carregar do GitHub: {e}")
     st.stop()
 
+# IMPORTANTÍSSIMO: sempre normaliza o df da sessão para não carregar “sujeira” antiga
 if st.session_state["df_work"] is None:
     st.session_state["df_work"] = df_base.copy()
-    st.session_state["_gh_sha"] = sha_base
-    st.session_state["_gh_raw"] = raw_base
+else:
+    st.session_state["df_work"] = collapse_to_base_columns(st.session_state["df_work"])
+
+st.session_state["_gh_sha"] = sha_base
+st.session_state["_gh_raw"] = raw_base
 
 df = st.session_state["df_work"]
 
@@ -314,9 +307,6 @@ with cB:
         st.rerun()
 
 
-# =========================
-# Views
-# =========================
 def view_lista():
     st.title("Transferências Internacionais — Atletas")
 
@@ -392,22 +382,18 @@ def view_ficha():
         st.caption("Ocorrências ordenadas: data mais antiga → mais recente.")
 
     base = df[df["NOME DO ATLETA"] == atleta].copy()
+    base = collapse_to_base_columns(base)
 
-    # Garante que ROW_ID é 1D (Series) e cria uma coluna "ROW_ID" única para exibição
     rid_series = first_col_as_series(base, "ROW_ID")
-    base = base.copy()
-    base["ROW_ID"] = rid_series
+    df_a = base[["DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
+    df_a.insert(0, "ROW_ID", rid_series.values)  # garante 1D
 
-    df_a = base[["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
-
-    # Ordenação robusta
     df_a["__DATA_SORT__"] = pd.to_datetime(df_a["DATA"], dayfirst=True, errors="coerce")
-    df_a["__RID__"] = pd.to_numeric(df_a["ROW_ID"], errors="coerce")
+    df_a["__RID__"] = pd.to_numeric(rid_series, errors="coerce")  # <- usa a Series garantida
     df_a = df_a.sort_values(["__DATA_SORT__", "__RID__"], ascending=[True, True], na_position="last")
 
-    # O data_editor NÃO aceita colunas duplicadas
     df_show = df_a[["ROW_ID", "DE", "PARA", "PAÍS", "DATA", "STATUS"]].copy()
-    df_show = dedupe_columns(df_show)
+    df_show = collapse_to_base_columns(df_show)
 
     edited = st.data_editor(
         df_show,
@@ -443,9 +429,9 @@ def view_ficha():
         )
 
 
-# Router
 if st.session_state["view"] == "lista":
     view_lista()
 else:
     view_ficha()
+
 
