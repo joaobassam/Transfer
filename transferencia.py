@@ -27,7 +27,7 @@ class GitHubCfg:
     token: str
     repo: str      # "user/repo"
     branch: str    # "main"
-    csv_path: str  # "data/arquivo.csv"
+    csv_path: str  # "arquivo.csv"
 
 
 def get_cfg_from_secrets() -> GitHubCfg:
@@ -35,12 +35,12 @@ def get_cfg_from_secrets() -> GitHubCfg:
         token = st.secrets["GITHUB_TOKEN"]
         repo = st.secrets["GITHUB_REPO"]
         branch = st.secrets.get("BRANCH", "main")
-        csv_path = st.secrets.get("CSV_PATH", "data/transferencias_internacionais.csv")
+        csv_path = st.secrets.get("CSV_PATH", "Transferencias_Internacionais_ATUALIZADO.csv")
         return GitHubCfg(token=token, repo=repo, branch=branch, csv_path=csv_path)
     except Exception:
         st.error(
             "Secrets não configurados. Configure em Streamlit Cloud → Settings → Secrets:\n"
-            "GITHUB_TOKEN, GITHUB_REPO, BRANCH (opcional), CSV_PATH."
+            'GITHUB_TOKEN, GITHUB_REPO, BRANCH (opcional), CSV_PATH (opcional).'
         )
         st.stop()
 
@@ -56,10 +56,7 @@ def gh_headers(token: str) -> dict:
 def gh_get_file(cfg: GitHubCfg) -> tuple[str, str]:
     """
     Retorna (conteudo_texto, sha).
-    Estratégia robusta:
-      1) chama /contents/{path}
-      2) se existir download_url, baixa o conteúdo real por ela (preferido)
-      3) senão, usa o campo base64 'content'
+    Baixa via download_url (mais robusto) quando disponível.
     """
     url = f"https://api.github.com/repos/{cfg.repo}/contents/{cfg.csv_path}"
     r = requests.get(url, headers=gh_headers(cfg.token), params={"ref": cfg.branch}, timeout=30)
@@ -69,38 +66,25 @@ def gh_get_file(cfg: GitHubCfg) -> tuple[str, str]:
         )
 
     data = r.json()
-
-    # Se o path for uma pasta, o GitHub retorna uma lista
     if isinstance(data, list):
-        raise RuntimeError(
-            f"CSV_PATH parece apontar para uma PASTA, não um arquivo: {cfg.csv_path}"
-        )
+        raise RuntimeError(f"CSV_PATH aponta para uma pasta, não um arquivo: {cfg.csv_path}")
 
     sha = data.get("sha", "")
     download_url = data.get("download_url")
 
-    # Preferência: baixar pelo download_url (mais confiável para arquivos maiores)
     if download_url:
         rr = requests.get(download_url, timeout=60)
         if rr.status_code != 200:
             raise RuntimeError(f"Falha ao baixar CSV pelo download_url ({rr.status_code}).")
         content = rr.content.decode("utf-8-sig", errors="replace")
     else:
-        # fallback: base64 'content'
         content_b64 = data.get("content", "")
         if not content_b64:
-            raise RuntimeError(
-                "GitHub não retornou content nem download_url. "
-                "Isso pode ocorrer em casos específicos (arquivo grande/estranho)."
-            )
+            raise RuntimeError("GitHub não retornou content nem download_url.")
         content = base64.b64decode(content_b64).decode("utf-8-sig", errors="replace")
 
     if not content.strip():
-        raise RuntimeError(
-            "O conteúdo do CSV vindo do GitHub está vazio.\n"
-            "Confira se o arquivo no repo tem dados e se CSV_PATH está correto."
-        )
-
+        raise RuntimeError("Conteúdo do CSV no GitHub está vazio. Confira o arquivo no repo.")
     return content, sha
 
 
@@ -119,12 +103,8 @@ def gh_put_file(cfg: GitHubCfg, new_text: str, sha: str, message: str) -> None:
 
 @st.cache_data(show_spinner=False)
 def load_df_from_github(cfg: GitHubCfg) -> tuple[pd.DataFrame, str, str]:
-    """
-    Retorna (df, sha, raw_text)
-    """
     raw_text, sha = gh_get_file(cfg)
 
-    # Aqui é onde estava estourando "No columns..." quando raw_text vinha vazio
     df = pd.read_csv(pd.io.common.StringIO(raw_text))
 
     required = ["NOME DO ATLETA", "DE", "PARA", "PAÍS", "DATA", "STATUS"]
@@ -136,6 +116,7 @@ def load_df_from_github(cfg: GitHubCfg) -> tuple[pd.DataFrame, str, str]:
     df["ANO"] = df["DATA_DT"].dt.year
     df["STATUS"] = df["STATUS"].apply(normalize_status)
 
+    # ID estável baseado na ordem do arquivo atual
     df = df.reset_index(drop=False).rename(columns={"index": "ROW_ID"})
     return df, sha, raw_text
 
@@ -153,25 +134,31 @@ def apply_status_updates(df_full: pd.DataFrame, edited_rows: pd.DataFrame) -> pd
     df_new = df_full.copy()
     upd = edited_rows[["ROW_ID", "STATUS"]].copy()
     upd["STATUS"] = upd["STATUS"].apply(normalize_status)
+
     upd_map = dict(zip(upd["ROW_ID"], upd["STATUS"]))
-
-    def _new_status(rid):
-        if rid in upd_map:
-            return upd_map[rid]
-        return df_new.loc[df_new["ROW_ID"] == rid, "STATUS"].iloc[0]
-
-    df_new["STATUS"] = df_new["ROW_ID"].map(_new_status)
+    df_new["STATUS"] = df_new.apply(lambda r: upd_map.get(r["ROW_ID"], r["STATUS"]), axis=1)
     return df_new
 
 
+# ✅ CORREÇÃO DO ERRO: não usar ("ROW_ID","count") no agg
 def build_resumo_por_atleta(df_in: pd.DataFrame) -> pd.DataFrame:
+    """
+    Versão robusta contra bug/edge-case do pandas com count em alguns ambientes.
+    Usa groupby.size() + agregações no STATUS.
+    """
+    if df_in.empty:
+        return pd.DataFrame(columns=["NOME DO ATLETA", "ocorrencias", "ok", "nao_ok", "pendente", "tem_pendencia"])
+
     g = df_in.groupby("NOME DO ATLETA", dropna=False)
-    resumo = g.agg(
-        ocorrencias=("ROW_ID", "count"),
-        ok=("STATUS", lambda s: (s == "Ok").sum()),
-        nao_ok=("STATUS", lambda s: (s == "Não-Ok").sum()),
-        pendente=("STATUS", lambda s: (s == "").sum()),
-    ).reset_index()
+
+    ocorr = g.size().rename("ocorrencias")  # <- robusto
+    stats = g["STATUS"].agg(
+        ok=lambda s: (s == "Ok").sum(),
+        nao_ok=lambda s: (s == "Não-Ok").sum(),
+        pendente=lambda s: (s == "").sum(),
+    )
+
+    resumo = pd.concat([ocorr, stats], axis=1).reset_index()
     resumo["tem_pendencia"] = resumo["pendente"] > 0
     return resumo
 
@@ -204,18 +191,17 @@ def save_to_github(cfg: GitHubCfg, current_df: pd.DataFrame, context_msg: str = 
     if context_msg:
         commit_msg += f" - {context_msg}"
 
-    # 1) tenta com sha atual
+    # tenta com SHA atual; se falhar, faz retry com SHA mais recente
     try:
         gh_put_file(cfg, new_text=new_text, sha=st.session_state["_gh_sha"], message=commit_msg)
         st.success("Salvo no GitHub com commit ✅")
     except Exception:
-        # 2) retry com sha mais recente
         st.warning("Arquivo mudou no GitHub. Tentando novamente com SHA mais recente...")
         latest_raw, latest_sha = gh_get_file(cfg)
         gh_put_file(cfg, new_text=new_text, sha=latest_sha, message=commit_msg)
         st.success("Salvo no GitHub com commit ✅ (retry)")
 
-    # Recarrega
+    # Recarrega para manter sha/raw e df consistentes
     load_df_from_github.clear()
     df_base2, sha2, raw2 = load_df_from_github(cfg)
     st.session_state["df_work"] = df_base2.copy()
@@ -298,8 +284,6 @@ with cB:
     if st.button("Ir p/ Lista", use_container_width=True):
         st.session_state["view"] = "lista"
         st.rerun()
-
-st.sidebar.caption("Pendente = STATUS vazio")
 
 
 # =========================
