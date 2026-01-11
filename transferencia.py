@@ -36,7 +36,7 @@ def get_cfg_from_secrets() -> GitHubCfg:
         token = st.secrets["GITHUB_TOKEN"]
         repo = st.secrets["GITHUB_REPO"]
         branch = st.secrets.get("BRANCH", "main")
-        csv_path = st.secrets.get("CSV_PATH", "data/transferencias_internacionais.csv")
+        csv_path = st.secrets.get("CSV_PATH", "Transferencias_Internacionais_ATUALIZADO.csv")
         return GitHubCfg(token=token, repo=repo, branch=branch, csv_path=csv_path)
     except Exception:
         st.error(
